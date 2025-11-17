@@ -24,8 +24,6 @@ const (
 
 type config struct {
 	CustomDomain   string
-	Mode           string
-	TargetUpstream string
 	ListenAddr     string
 	RequestTimeout time.Duration
 }
@@ -78,7 +76,10 @@ func main() {
 		clientNoRedirect: clientNoRedirect,
 	}
 
-	log.Printf("Docker proxy server started on %s (mode=%s)", cfg.ListenAddr, cfg.Mode)
+	log.Printf("Docker proxy server started on %s (domain=%s)", cfg.ListenAddr, cfg.CustomDomain)
+	for host, upstream := range srv.routes {
+		log.Printf("route registered host=%s upstream=%s", host, upstream)
+	}
 	if err := http.ListenAndServe(cfg.ListenAddr, srv); err != nil {
 		log.Fatalf("服务器运行失败: %v", err)
 	}
@@ -92,16 +93,6 @@ func loadConfig() (config, error) {
 	customDomain = normalizeHost(customDomain)
 	if customDomain == "" {
 		return config{}, errors.New("CUSTOM_DOMAIN 格式不正确")
-	}
-
-	mode := strings.TrimSpace(os.Getenv("MODE"))
-	if mode == "" {
-		mode = "production"
-	}
-
-	targetUpstream := strings.TrimSpace(os.Getenv("TARGET_UPSTREAM"))
-	if targetUpstream == "" {
-		targetUpstream = dockerHubUpstream
 	}
 
 	listenAddr := strings.TrimSpace(os.Getenv("LISTEN_ADDR"))
@@ -118,8 +109,6 @@ func loadConfig() (config, error) {
 
 	return config{
 		CustomDomain:   customDomain,
-		Mode:           strings.ToLower(mode),
-		TargetUpstream: targetUpstream,
 		ListenAddr:     listenAddr,
 		RequestTimeout: timeout,
 	}, nil
@@ -140,48 +129,57 @@ func buildRoutes(customDomain string) map[string]string {
 }
 
 func (ps *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	recorder := &responseRecorder{ResponseWriter: w}
+	start := time.Now()
+	defer func() {
+		log.Printf("request method=%s path=%s host=%s status=%d bytes=%d duration=%s", r.Method, r.URL.Path, r.Host, recorder.statusCode(), recorder.bytesWritten(), time.Since(start))
+	}()
+
 	ctx, cancel := context.WithTimeout(r.Context(), ps.cfg.RequestTimeout)
 	defer cancel()
 	r = r.WithContext(ctx)
 
+	if r.URL.Path == "/_healthz" {
+		ps.handleHealthz(recorder, r)
+		return
+	}
+
 	if r.URL.Path == "/" {
 		target := fmt.Sprintf("%s://%s/v2/", schemeFromRequest(r), r.Host)
-		http.Redirect(w, r, target, http.StatusMovedPermanently)
+		http.Redirect(recorder, r, target, http.StatusMovedPermanently)
 		return
 	}
 
 	upstream := ps.routeByHost(normalizeHost(r.Host))
 	if upstream == "" {
-		ps.respondJSON(w, http.StatusNotFound, map[string]any{"routes": ps.routes})
+		log.Printf("未找到匹配路由 host=%s path=%s", r.Host, r.URL.Path)
+		ps.respondJSON(recorder, http.StatusNotFound, map[string]any{"routes": ps.routes})
 		return
 	}
 
 	switch r.URL.Path {
 	case "/v2/":
-		ps.handleV2Root(w, r, upstream)
+		ps.handleV2Root(recorder, r, upstream)
 		return
 	case "/v2/auth":
-		ps.handleToken(w, r, upstream)
+		ps.handleToken(recorder, r, upstream)
 		return
 	}
 
 	if upstream == dockerHubUpstream {
 		if newPath, ok := ensureLibraryPath(r.URL.Path); ok {
 			target := fmt.Sprintf("%s://%s%s", schemeFromRequest(r), r.Host, newPath)
-			http.Redirect(w, r, target, http.StatusMovedPermanently)
+			http.Redirect(recorder, r, target, http.StatusMovedPermanently)
 			return
 		}
 	}
 
-	ps.forwardRequest(w, r, upstream)
+	ps.forwardRequest(recorder, r, upstream)
 }
 
 func (ps *proxyServer) routeByHost(host string) string {
 	if upstream, ok := ps.routes[host]; ok {
 		return upstream
-	}
-	if ps.cfg.Mode == "debug" {
-		return ps.cfg.TargetUpstream
 	}
 	return ""
 }
@@ -451,13 +449,10 @@ func ensureLibraryScope(scope string) string {
 }
 
 func (ps *proxyServer) responseUnauthorized(w http.ResponseWriter, r *http.Request) {
-	scheme := "https"
-	host := r.Host
-	if ps.cfg.Mode == "debug" {
-		scheme = "http"
-	}
-	if ps.cfg.Mode != "debug" {
-		host = normalizeHost(host)
+	scheme := schemeFromRequest(r)
+	host := normalizeHost(r.Host)
+	if host == "" {
+		host = ps.cfg.CustomDomain
 	}
 	realm := fmt.Sprintf(`Bearer realm="%s://%s/v2/auth",service="%s"`, scheme, host, serviceName)
 	w.Header().Set("Www-Authenticate", realm)
@@ -519,4 +514,85 @@ func schemeFromRequest(r *http.Request) string {
 		return strings.TrimSpace(scheme)
 	}
 	return "http"
+}
+
+func (ps *proxyServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	checkCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	results := make(map[string]string, len(ps.routes))
+	healthy := true
+
+	for host, upstream := range ps.routes {
+		if err := ps.checkUpstream(checkCtx, upstream); err != nil {
+			results[host] = err.Error()
+			healthy = false
+		} else {
+			results[host] = "ok"
+		}
+	}
+
+	status := http.StatusOK
+	state := "ok"
+	if !healthy {
+		status = http.StatusServiceUnavailable
+		state = "degraded"
+	}
+
+	ps.respondJSON(w, status, map[string]any{
+		"status":    state,
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"checks":    results,
+	})
+}
+
+func (ps *proxyServer) checkUpstream(ctx context.Context, upstream string) error {
+	target := strings.TrimSuffix(upstream, "/") + "/v2/"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := ps.clientFollow.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return fmt.Errorf("status %d from %s", resp.StatusCode, upstream)
+	}
+	return nil
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (rw *responseRecorder) WriteHeader(statusCode int) {
+	rw.status = statusCode
+	rw.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (rw *responseRecorder) Write(b []byte) (int, error) {
+	if rw.status == 0 {
+		rw.status = http.StatusOK
+	}
+	n, err := rw.ResponseWriter.Write(b)
+	rw.bytes += int64(n)
+	return n, err
+}
+
+func (rw *responseRecorder) statusCode() int {
+	if rw.status == 0 {
+		return http.StatusOK
+	}
+	return rw.status
+}
+
+func (rw *responseRecorder) bytesWritten() int64 {
+	return rw.bytes
 }
