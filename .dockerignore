@@ -1,0 +1,14 @@
+**/.DS_Store
+.git
+.github
+/dist
+/bin
+/build
+Dockerfile
+README.md
+*.log
+*.tmp
+node_modules
+vendor
+
+
