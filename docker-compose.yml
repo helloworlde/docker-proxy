@@ -1,0 +1,10 @@
+services:
+  docker-proxy:
+    image: ghcr.io/helloworlde/docker-proxy:main
+    environment:
+      CUSTOM_DOMAIN: ${CUSTOM_DOMAIN:?请设置要代理的自定义域名}
+      LISTEN_ADDR: ":${PORT:-8080}"
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-30s}
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    restart: unless-stopped

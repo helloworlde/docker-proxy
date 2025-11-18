@@ -14,13 +14,30 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
 	dockerHubUpstream = "https://registry-1.docker.io"
 	serviceName       = "docker-proxy"
 	defaultListenAddr = ":8080"
+	defaultTimeout    = 30 * time.Second
 )
+
+type proxyServer struct {
+	cfg              config
+	routes           map[string]string
+	clientFollow     *http.Client
+	clientNoRedirect *http.Client
+	metricsRegistry  *prometheus.Registry
+	metricsHandler   http.Handler
+	requestsTotal    *prometheus.CounterVec
+	requestDuration  *prometheus.HistogramVec
+	bytesTransferred *prometheus.CounterVec
+	imagePulls       *prometheus.CounterVec
+}
 
 type config struct {
 	CustomDomain   string
@@ -28,16 +45,24 @@ type config struct {
 	RequestTimeout time.Duration
 }
 
-type proxyServer struct {
-	cfg              config
-	routes           map[string]string
-	clientFollow     *http.Client
-	clientNoRedirect *http.Client
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
 }
 
-type authenticateHeader struct {
-	Realm   string
-	Service string
+func (rw *responseRecorder) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseRecorder) Write(b []byte) (int, error) {
+	if rw.status == 0 {
+		rw.status = 200
+	}
+	n, err := rw.ResponseWriter.Write(b)
+	rw.bytes += int64(n)
+	return n, err
 }
 
 func main() {
@@ -56,264 +81,260 @@ func main() {
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 
-	clientFollow := &http.Client{
-		Transport: transport,
-		Timeout:   cfg.RequestTimeout,
-	}
-
-	clientNoRedirect := &http.Client{
-		Transport: transport,
-		Timeout:   cfg.RequestTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
+	reg := prometheus.NewRegistry()
 	srv := &proxyServer{
-		cfg:              cfg,
-		routes:           buildRoutes(cfg.CustomDomain),
-		clientFollow:     clientFollow,
-		clientNoRedirect: clientNoRedirect,
+		cfg:    cfg,
+		routes: buildRoutes(cfg.CustomDomain),
+		clientFollow: &http.Client{
+			Transport: transport,
+			Timeout:   cfg.RequestTimeout,
+		},
+		clientNoRedirect: &http.Client{
+			Transport: transport,
+			Timeout:   cfg.RequestTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		metricsRegistry: reg,
+		requestsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "docker_proxy_requests_total", Help: "Total requests"},
+			[]string{"source_ip", "domain", "status"},
+		),
+		requestDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{Name: "docker_proxy_request_duration_seconds", Help: "Request duration"},
+			[]string{"domain", "status"},
+		),
+		bytesTransferred: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "docker_proxy_bytes_transferred_total", Help: "Bytes transferred"},
+			[]string{"domain", "direction"},
+		),
+		imagePulls: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "docker_proxy_image_pulls_total", Help: "Image pulls"},
+			[]string{"image", "domain", "registry"},
+		),
 	}
 
-	log.Printf("Docker proxy server started on %s (domain=%s)", cfg.ListenAddr, cfg.CustomDomain)
+	reg.MustRegister(srv.requestsTotal, srv.requestDuration, srv.bytesTransferred, srv.imagePulls)
+	srv.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+
+	log.Printf("启动服务 addr=%s domain=%s timeout=%s", cfg.ListenAddr, cfg.CustomDomain, cfg.RequestTimeout)
 	for host, upstream := range srv.routes {
-		log.Printf("route registered host=%s upstream=%s", host, upstream)
+		log.Printf("路由 %s -> %s", host, upstream)
 	}
+
 	if err := http.ListenAndServe(cfg.ListenAddr, srv); err != nil {
-		log.Fatalf("服务器运行失败: %v", err)
+		log.Fatalf("启动失败: %v", err)
 	}
 }
 
 func loadConfig() (config, error) {
-	customDomain := strings.TrimSpace(os.Getenv("CUSTOM_DOMAIN"))
-	if customDomain == "" {
-		return config{}, errors.New("必须设置环境变量 CUSTOM_DOMAIN")
-	}
-	customDomain = normalizeHost(customDomain)
-	if customDomain == "" {
-		return config{}, errors.New("CUSTOM_DOMAIN 格式不正确")
+	domain := normalizeHost(os.Getenv("CUSTOM_DOMAIN"))
+	if domain == "" {
+		return config{}, errors.New("CUSTOM_DOMAIN 必须设置")
 	}
 
-	listenAddr := strings.TrimSpace(os.Getenv("LISTEN_ADDR"))
-	if listenAddr == "" {
-		listenAddr = defaultListenAddr
+	addr := strings.TrimSpace(os.Getenv("LISTEN_ADDR"))
+	if addr == "" {
+		addr = defaultListenAddr
 	}
 
-	timeout := 30 * time.Second
-	if raw := strings.TrimSpace(os.Getenv("REQUEST_TIMEOUT")); raw != "" {
-		if parsed, err := time.ParseDuration(raw); err == nil {
-			timeout = parsed
+	timeout := defaultTimeout
+	if raw := os.Getenv("REQUEST_TIMEOUT"); raw != "" {
+		if t, err := time.ParseDuration(raw); err == nil && t > 0 {
+			timeout = t
 		}
 	}
 
-	return config{
-		CustomDomain:   customDomain,
-		ListenAddr:     listenAddr,
-		RequestTimeout: timeout,
-	}, nil
+	return config{CustomDomain: domain, ListenAddr: addr, RequestTimeout: timeout}, nil
 }
 
-func buildRoutes(customDomain string) map[string]string {
+func buildRoutes(domain string) map[string]string {
 	return map[string]string{
-		"docker." + customDomain:         dockerHubUpstream,
-		"quay." + customDomain:           "https://quay.io",
-		"gcr." + customDomain:            "https://gcr.io",
-		"k8s-gcr." + customDomain:        "https://k8s.gcr.io",
-		"k8s." + customDomain:            "https://registry.k8s.io",
-		"ghcr." + customDomain:           "https://ghcr.io",
-		"cloudsmith." + customDomain:     "https://docker.cloudsmith.io",
-		"ecr." + customDomain:            "https://public.ecr.aws",
-		"docker-staging." + customDomain: dockerHubUpstream,
+		"docker." + domain:         dockerHubUpstream,
+		"docker-staging." + domain: dockerHubUpstream,
+		"quay." + domain:           "https://quay.io",
+		"gcr." + domain:            "https://gcr.io",
+		"k8s-gcr." + domain:        "https://k8s.gcr.io",
+		"k8s." + domain:            "https://registry.k8s.io",
+		"ghcr." + domain:           "https://ghcr.io",
+		"cloudsmith." + domain:     "https://docker.cloudsmith.io",
+		"ecr." + domain:            "https://public.ecr.aws",
 	}
 }
 
 func (ps *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	recorder := &responseRecorder{ResponseWriter: w}
+	rec := &responseRecorder{ResponseWriter: w}
 	start := time.Now()
+	ip := getClientIP(r)
+	host := normalizeHost(r.Host)
+
 	defer func() {
-		log.Printf("request method=%s path=%s host=%s status=%d bytes=%d duration=%s", r.Method, r.URL.Path, r.Host, recorder.statusCode(), recorder.bytesWritten(), time.Since(start))
+		duration := time.Since(start)
+		status := rec.status
+		if status == 0 {
+			status = 200
+		}
+		statusStr := strconv.Itoa(status)
+
+		ps.requestsTotal.WithLabelValues(ip, host, statusStr).Inc()
+		ps.requestDuration.WithLabelValues(host, statusStr).Observe(duration.Seconds())
+		if rec.bytes > 0 {
+			ps.bytesTransferred.WithLabelValues(host, "downstream").Add(float64(rec.bytes))
+		}
+
+		log.Printf("%s %s %s -> %d (%d bytes, %s) [%s]",
+			r.Method, r.Host, r.URL.Path, status, rec.bytes, duration.Round(time.Millisecond), ip)
 	}()
+
+	// 特殊端点
+	if r.URL.Path == "/metrics" {
+		ps.metricsHandler.ServeHTTP(rec, r)
+		return
+	}
+	if r.URL.Path == "/health" || r.URL.Path == "/" {
+		ps.jsonResponse(rec, 200, map[string]string{"status": "ok"})
+		return
+	}
+
+	// 路由验证
+	upstream := ps.routes[host]
+	if upstream == "" {
+		log.Printf("拒绝 host=%s path=%s ip=%s", r.Host, r.URL.Path, ip)
+		ps.jsonResponse(rec, 403, map[string]string{"error": "Forbidden"})
+		return
+	}
+
+	// 记录镜像拉取
+	if img := extractImage(r.URL.Path); img != "" {
+		ps.imagePulls.WithLabelValues(img, host, strings.Split(host, ".")[0]).Inc()
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), ps.cfg.RequestTimeout)
 	defer cancel()
-	r = r.WithContext(ctx)
 
-	if r.URL.Path == "/_healthz" {
-		ps.handleHealthz(recorder, r)
-		return
-	}
-
-	if r.URL.Path == "/" {
-		target := fmt.Sprintf("%s://%s/v2/", schemeFromRequest(r), r.Host)
-		http.Redirect(recorder, r, target, http.StatusMovedPermanently)
-		return
-	}
-
-	upstream := ps.routeByHost(normalizeHost(r.Host))
-	if upstream == "" {
-		log.Printf("未找到匹配路由 host=%s path=%s", r.Host, r.URL.Path)
-		ps.respondJSON(recorder, http.StatusNotFound, map[string]any{"routes": ps.routes})
-		return
-	}
-
+	// 处理请求
 	switch r.URL.Path {
 	case "/v2/":
-		ps.handleV2Root(recorder, r, upstream)
-		return
+		ps.proxyV2Root(rec, r.WithContext(ctx), upstream)
 	case "/v2/auth":
-		ps.handleToken(recorder, r, upstream)
-		return
-	}
-
-	if upstream == dockerHubUpstream {
-		if newPath, ok := ensureLibraryPath(r.URL.Path); ok {
-			target := fmt.Sprintf("%s://%s%s", schemeFromRequest(r), r.Host, newPath)
-			http.Redirect(recorder, r, target, http.StatusMovedPermanently)
-			return
+		ps.proxyAuth(rec, r.WithContext(ctx), upstream)
+	default:
+		// Docker Hub library 前缀
+		if upstream == dockerHubUpstream {
+			if newPath := ensureLibrary(r.URL.Path); newPath != "" {
+				scheme := "http"
+				if r.TLS != nil {
+					scheme = "https"
+				} else if s := r.Header.Get("X-Forwarded-Proto"); s != "" {
+					scheme = strings.Split(s, ",")[0]
+				}
+				http.Redirect(rec, r, scheme+"://"+r.Host+newPath, 301)
+				return
+			}
 		}
+		ps.proxyForward(rec, r.WithContext(ctx), upstream)
 	}
-
-	ps.forwardRequest(recorder, r, upstream)
 }
 
-func (ps *proxyServer) routeByHost(host string) string {
-	if upstream, ok := ps.routes[host]; ok {
-		return upstream
-	}
-	return ""
-}
-
-func (ps *proxyServer) handleV2Root(w http.ResponseWriter, r *http.Request, upstream string) {
-	target, err := url.Parse(upstream + "/v2/")
+func (ps *proxyServer) proxyV2Root(w http.ResponseWriter, r *http.Request, upstream string) {
+	req, err := http.NewRequestWithContext(r.Context(), "GET", upstream+"/v2/", nil)
 	if err != nil {
-		ps.gatewayError(w, err)
+		ps.errorResponse(w, err)
 		return
 	}
-
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
-	if err != nil {
-		ps.gatewayError(w, err)
-		return
-	}
-
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 
 	resp, err := ps.clientFollow.Do(req)
 	if err != nil {
-		ps.gatewayError(w, err)
+		ps.errorResponse(w, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		ps.responseUnauthorized(w, r)
+	if resp.StatusCode == 401 {
+		ps.unauthorizedResponse(w, r)
 		return
 	}
-
-	copyResponse(w, resp)
+	ps.copyResponse(w, resp)
 }
 
-func (ps *proxyServer) handleToken(w http.ResponseWriter, r *http.Request, upstream string) {
-	checkURL, err := url.Parse(upstream + "/v2/")
+func (ps *proxyServer) proxyAuth(w http.ResponseWriter, r *http.Request, upstream string) {
+	req, err := http.NewRequestWithContext(r.Context(), "GET", upstream+"/v2/", nil)
 	if err != nil {
-		ps.gatewayError(w, err)
-		return
-	}
-
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, checkURL.String(), nil)
-	if err != nil {
-		ps.gatewayError(w, err)
+		ps.errorResponse(w, err)
 		return
 	}
 
 	resp, err := ps.clientFollow.Do(req)
 	if err != nil {
-		ps.gatewayError(w, err)
+		ps.errorResponse(w, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusUnauthorized {
-		copyResponse(w, resp)
+	if resp.StatusCode != 401 {
+		ps.copyResponse(w, resp)
 		return
 	}
 
-	headerValue := resp.Header.Get("Www-Authenticate")
-	if headerValue == "" {
-		copyResponse(w, resp)
+	authHdr := resp.Header.Get("Www-Authenticate")
+	if authHdr == "" {
+		ps.copyResponse(w, resp)
 		return
 	}
 
-	parsed, err := parseAuthenticate(headerValue)
-	if err != nil {
-		ps.gatewayError(w, err)
+	realm, service := parseAuth(authHdr)
+	if realm == "" {
+		ps.errorResponse(w, errors.New("invalid auth header"))
 		return
 	}
 
 	scope := r.URL.Query().Get("scope")
-	if scope != "" && upstream == dockerHubUpstream {
-		scope = ensureLibraryScope(scope)
+	if scope != "" && upstream == dockerHubUpstream && !strings.Contains(scope, "/") {
+		parts := strings.SplitN(scope, ":", 3)
+		if len(parts) == 3 {
+			scope = parts[0] + ":library/" + parts[1] + ":" + parts[2]
+		}
 	}
 
-	tokenResp, err := ps.fetchToken(r.Context(), parsed, scope, r.Header.Get("Authorization"))
+	tokenURL, _ := url.Parse(realm)
+	q := tokenURL.Query()
+	if service != "" {
+		q.Set("service", service)
+	}
+	if scope != "" {
+		q.Set("scope", scope)
+	}
+	tokenURL.RawQuery = q.Encode()
+
+	tokenReq, _ := http.NewRequestWithContext(r.Context(), "GET", tokenURL.String(), nil)
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		tokenReq.Header.Set("Authorization", auth)
+	}
+
+	tokenResp, err := ps.clientFollow.Do(tokenReq)
 	if err != nil {
-		ps.gatewayError(w, err)
+		ps.errorResponse(w, err)
 		return
 	}
 	defer tokenResp.Body.Close()
-
-	copyResponse(w, tokenResp)
+	ps.copyResponse(w, tokenResp)
 }
 
-func (ps *proxyServer) fetchToken(ctx context.Context, authenticate authenticateHeader, scope, authorization string) (*http.Response, error) {
-	tokenURL, err := url.Parse(authenticate.Realm)
-	if err != nil {
-		return nil, err
-	}
-
-	query := tokenURL.Query()
-	if authenticate.Service != "" {
-		query.Set("service", authenticate.Service)
-	}
-	if scope != "" {
-		query.Set("scope", scope)
-	}
-	tokenURL.RawQuery = query.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	if authorization != "" {
-		req.Header.Set("Authorization", authorization)
-	}
-
-	return ps.clientFollow.Do(req)
-}
-
-func (ps *proxyServer) forwardRequest(w http.ResponseWriter, r *http.Request, upstream string) {
-	targetBase, err := url.Parse(upstream)
-	if err != nil {
-		ps.gatewayError(w, err)
-		return
-	}
-
-	outURL := targetBase.ResolveReference(&url.URL{
-		Path:     r.URL.Path,
-		RawQuery: r.URL.RawQuery,
-	})
+func (ps *proxyServer) proxyForward(w http.ResponseWriter, r *http.Request, upstream string) {
+	target, _ := url.Parse(upstream)
+	outURL := target.ResolveReference(&url.URL{Path: r.URL.Path, RawQuery: r.URL.RawQuery})
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), r.Body)
 	if err != nil {
-		ps.gatewayError(w, err)
+		ps.errorResponse(w, err)
 		return
 	}
-
 	req.Header = r.Header.Clone()
-	req.Host = targetBase.Host
+	req.Host = target.Host
 
 	client := ps.clientFollow
 	if upstream == dockerHubUpstream {
@@ -322,165 +343,167 @@ func (ps *proxyServer) forwardRequest(w http.ResponseWriter, r *http.Request, up
 
 	resp, err := client.Do(req)
 	if err != nil {
-		ps.gatewayError(w, err)
+		ps.errorResponse(w, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		ps.responseUnauthorized(w, r)
+	if resp.StatusCode == 401 {
+		ps.unauthorizedResponse(w, r)
 		return
 	}
 
-	if upstream == dockerHubUpstream && resp.StatusCode == http.StatusTemporaryRedirect {
-		location := resp.Header.Get("Location")
-		if location == "" {
-			copyResponse(w, resp)
+	// Docker Hub 重定向处理
+	if upstream == dockerHubUpstream && resp.StatusCode == 307 {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			redirectReq, _ := http.NewRequestWithContext(r.Context(), "GET", loc, nil)
+			redirectResp, err := ps.clientFollow.Do(redirectReq)
+			if err != nil {
+				ps.errorResponse(w, err)
+				return
+			}
+			defer redirectResp.Body.Close()
+			ps.copyResponse(w, redirectResp)
 			return
 		}
-		redirectReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, location, nil)
-		if err != nil {
-			ps.gatewayError(w, err)
-			return
-		}
-		redirectResp, err := ps.clientFollow.Do(redirectReq)
-		if err != nil {
-			ps.gatewayError(w, err)
-			return
-		}
-		defer redirectResp.Body.Close()
-		copyResponse(w, redirectResp)
-		return
 	}
 
-	copyResponse(w, resp)
+	ps.copyResponse(w, resp)
 }
 
-func parseAuthenticate(header string) (authenticateHeader, error) {
-	var result authenticateHeader
-	header = strings.TrimSpace(header)
-	if header == "" {
-		return result, errors.New("空的 WWW-Authenticate 头")
+func (ps *proxyServer) unauthorizedResponse(w http.ResponseWriter, r *http.Request) {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if s := r.Header.Get("X-Forwarded-Proto"); s != "" {
+		scheme = strings.Split(s, ",")[0]
 	}
 
-	lower := strings.ToLower(header)
-	if strings.HasPrefix(lower, "bearer ") {
-		header = header[len("Bearer "):]
-	} else if strings.HasPrefix(lower, "bearer\t") {
-		header = header[len("Bearer\t"):]
-	}
-
-	for _, token := range splitAuthParams(header) {
-		if token == "" {
-			continue
-		}
-		keyValue := strings.SplitN(token, "=", 2)
-		if len(keyValue) != 2 {
-			continue
-		}
-		key := strings.ToLower(strings.TrimSpace(keyValue[0]))
-		value := strings.TrimSpace(keyValue[1])
-		if decoded, err := strconv.Unquote(value); err == nil {
-			value = decoded
-		} else {
-			value = strings.Trim(value, `"`)
-		}
-		switch key {
-		case "realm":
-			result.Realm = value
-		case "service":
-			result.Service = value
-		}
-	}
-
-	if result.Realm == "" {
-		return result, fmt.Errorf("无效的 WWW-Authenticate 头: %s", header)
-	}
-	return result, nil
-}
-
-func splitAuthParams(header string) []string {
-	var parts []string
-	var buf strings.Builder
-	inQuotes := false
-	escape := false
-
-	for _, r := range header {
-		switch {
-		case escape:
-			buf.WriteRune(r)
-			escape = false
-		case r == '\\' && inQuotes:
-			escape = true
-		case r == '"':
-			inQuotes = !inQuotes
-			buf.WriteRune(r)
-		case r == ',' && !inQuotes:
-			parts = append(parts, strings.TrimSpace(buf.String()))
-			buf.Reset()
-		default:
-			buf.WriteRune(r)
-		}
-	}
-	if buf.Len() > 0 {
-		parts = append(parts, strings.TrimSpace(buf.String()))
-	}
-	return parts
-}
-
-func ensureLibraryPath(path string) (string, bool) {
-	parts := strings.Split(path, "/")
-	if len(parts) == 5 && parts[0] == "" && parts[1] == "v2" && parts[2] != "library" {
-		newParts := append([]string{}, parts[:2]...)
-		newParts = append(newParts, "library")
-		newParts = append(newParts, parts[2:]...)
-		return strings.Join(newParts, "/"), true
-	}
-	return "", false
-}
-
-func ensureLibraryScope(scope string) string {
-	splits := strings.Split(scope, ":")
-	if len(splits) == 3 && !strings.Contains(splits[1], "/") {
-		splits[1] = "library/" + splits[1]
-		return strings.Join(splits, ":")
-	}
-	return scope
-}
-
-func (ps *proxyServer) responseUnauthorized(w http.ResponseWriter, r *http.Request) {
-	scheme := schemeFromRequest(r)
 	host := normalizeHost(r.Host)
 	if host == "" {
 		host = ps.cfg.CustomDomain
 	}
-	realm := fmt.Sprintf(`Bearer realm="%s://%s/v2/auth",service="%s"`, scheme, host, serviceName)
-	w.Header().Set("Www-Authenticate", realm)
-	ps.respondJSON(w, http.StatusUnauthorized, map[string]string{"message": "UNAUTHORIZED"})
+
+	w.Header().Set("Www-Authenticate", fmt.Sprintf(`Bearer realm="%s://%s/v2/auth",service="%s"`, scheme, host, serviceName))
+	ps.jsonResponse(w, 401, map[string]string{"error": "Unauthorized"})
 }
 
-func (ps *proxyServer) gatewayError(w http.ResponseWriter, err error) {
-	log.Printf("上游请求失败: %v", err)
-	ps.respondJSON(w, http.StatusBadGateway, map[string]string{
-		"message": "BAD_GATEWAY",
-		"error":   err.Error(),
-	})
-}
-
-func (ps *proxyServer) respondJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func copyResponse(w http.ResponseWriter, resp *http.Response) {
+func (ps *proxyServer) copyResponse(w http.ResponseWriter, resp *http.Response) {
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	io.Copy(w, resp.Body)
+}
+
+func (ps *proxyServer) errorResponse(w http.ResponseWriter, err error) {
+	log.Printf("上游错误: %v", err)
+	ps.jsonResponse(w, 502, map[string]string{"error": err.Error()})
+}
+
+func (ps *proxyServer) jsonResponse(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+// 工具函数
+
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		return strings.TrimSpace(strings.Split(xff, ",")[0])
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return ip
+	}
+	return r.RemoteAddr
+}
+
+func extractImage(path string) string {
+	// /v2/{name}/(manifests|blobs|tags)/{ref}
+	if !strings.HasPrefix(path, "/v2/") {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) < 5 {
+		return ""
+	}
+	action := parts[len(parts)-2]
+	if action == "manifests" || action == "blobs" || action == "tags" {
+		return strings.Join(parts[2:len(parts)-2], "/")
+	}
+	return ""
+}
+
+func ensureLibrary(path string) string {
+	// /v2/{name}/{action}/{ref} -> /v2/library/{name}/{action}/{ref}
+	parts := strings.Split(path, "/")
+	if len(parts) == 5 && parts[1] == "v2" && parts[2] != "library" {
+		return "/v2/library/" + parts[2] + "/" + parts[3] + "/" + parts[4]
+	}
+	return ""
+}
+
+func parseAuth(header string) (realm, service string) {
+	header = strings.TrimSpace(header)
+	if strings.HasPrefix(strings.ToLower(header), "bearer ") {
+		header = header[7:]
+	}
+
+	inQuote := false
+	escape := false
+	var key, val strings.Builder
+
+	flush := func() {
+		k := strings.ToLower(strings.TrimSpace(key.String()))
+		v := strings.Trim(strings.TrimSpace(val.String()), `"`)
+		if k == "realm" {
+			realm = v
+		} else if k == "service" {
+			service = v
+		}
+		key.Reset()
+		val.Reset()
+	}
+
+	inValue := false
+	for _, c := range header {
+		if escape {
+			val.WriteRune(c)
+			escape = false
+			continue
+		}
+		if c == '\\' && inQuote {
+			escape = true
+			continue
+		}
+		if c == '"' {
+			inQuote = !inQuote
+			val.WriteRune(c)
+			continue
+		}
+		if c == '=' && !inQuote {
+			inValue = true
+			continue
+		}
+		if c == ',' && !inQuote {
+			flush()
+			inValue = false
+			continue
+		}
+		if inValue {
+			val.WriteRune(c)
+		} else {
+			key.WriteRune(c)
+		}
+	}
+	flush()
+	return
 }
 
 func normalizeHost(host string) string {
@@ -497,102 +520,8 @@ func normalizeHost(host string) string {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		return h
 	}
-	if idx := strings.Index(host, ":"); idx > 0 {
-		return host[:idx]
+	if i := strings.Index(host, ":"); i > 0 {
+		return host[:i]
 	}
 	return host
-}
-
-func schemeFromRequest(r *http.Request) string {
-	if r.TLS != nil {
-		return "https"
-	}
-	if scheme := r.Header.Get("X-Forwarded-Proto"); scheme != "" {
-		if idx := strings.Index(scheme, ","); idx > 0 {
-			return strings.TrimSpace(scheme[:idx])
-		}
-		return strings.TrimSpace(scheme)
-	}
-	return "http"
-}
-
-func (ps *proxyServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	checkCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	results := make(map[string]string, len(ps.routes))
-	healthy := true
-
-	for host, upstream := range ps.routes {
-		if err := ps.checkUpstream(checkCtx, upstream); err != nil {
-			results[host] = err.Error()
-			healthy = false
-		} else {
-			results[host] = "ok"
-		}
-	}
-
-	status := http.StatusOK
-	state := "ok"
-	if !healthy {
-		status = http.StatusServiceUnavailable
-		state = "degraded"
-	}
-
-	ps.respondJSON(w, status, map[string]any{
-		"status":    state,
-		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-		"checks":    results,
-	})
-}
-
-func (ps *proxyServer) checkUpstream(ctx context.Context, upstream string) error {
-	target := strings.TrimSuffix(upstream, "/") + "/v2/"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := ps.clientFollow.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	_, _ = io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode >= http.StatusInternalServerError {
-		return fmt.Errorf("status %d from %s", resp.StatusCode, upstream)
-	}
-	return nil
-}
-
-type responseRecorder struct {
-	http.ResponseWriter
-	status int
-	bytes  int64
-}
-
-func (rw *responseRecorder) WriteHeader(statusCode int) {
-	rw.status = statusCode
-	rw.ResponseWriter.WriteHeader(statusCode)
-}
-
-func (rw *responseRecorder) Write(b []byte) (int, error) {
-	if rw.status == 0 {
-		rw.status = http.StatusOK
-	}
-	n, err := rw.ResponseWriter.Write(b)
-	rw.bytes += int64(n)
-	return n, err
-}
-
-func (rw *responseRecorder) statusCode() int {
-	if rw.status == 0 {
-		return http.StatusOK
-	}
-	return rw.status
-}
-
-func (rw *responseRecorder) bytesWritten() int64 {
-	return rw.bytes
 }
