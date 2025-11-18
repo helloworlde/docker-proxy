@@ -58,7 +58,7 @@ func (rw *responseRecorder) WriteHeader(code int) {
 
 func (rw *responseRecorder) Write(b []byte) (int, error) {
 	if rw.status == 0 {
-		rw.status = 200
+		rw.status = http.StatusOK
 	}
 	n, err := rw.ResponseWriter.Write(b)
 	rw.bytes += int64(n)
@@ -173,7 +173,7 @@ func (ps *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		duration := time.Since(start)
 		status := rec.status
 		if status == 0 {
-			status = 200
+			status = http.StatusOK
 		}
 		statusStr := strconv.Itoa(status)
 
@@ -193,7 +193,7 @@ func (ps *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/health" || r.URL.Path == "/" {
-		ps.jsonResponse(rec, 200, map[string]string{"status": "ok"})
+		ps.jsonResponse(rec, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
 
@@ -201,7 +201,7 @@ func (ps *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upstream := ps.routes[host]
 	if upstream == "" {
 		log.Printf("拒绝 host=%s path=%s ip=%s", r.Host, r.URL.Path, ip)
-		ps.jsonResponse(rec, 403, map[string]string{"error": "Forbidden"})
+		ps.jsonResponse(rec, http.StatusForbidden, map[string]string{"error": "Forbidden"})
 		return
 	}
 
@@ -229,7 +229,7 @@ func (ps *proxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				} else if s := r.Header.Get("X-Forwarded-Proto"); s != "" {
 					scheme = strings.Split(s, ",")[0]
 				}
-				http.Redirect(rec, r, scheme+"://"+r.Host+newPath, 301)
+				http.Redirect(rec, r, scheme+"://"+r.Host+newPath, http.StatusMovedPermanently)
 				return
 			}
 		}
@@ -254,7 +254,7 @@ func (ps *proxyServer) proxyV2Root(w http.ResponseWriter, r *http.Request, upstr
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 401 {
+	if resp.StatusCode == http.StatusUnauthorized {
 		ps.unauthorizedResponse(w, r)
 		return
 	}
@@ -275,7 +275,7 @@ func (ps *proxyServer) proxyAuth(w http.ResponseWriter, r *http.Request, upstrea
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 401 {
+	if resp.StatusCode != http.StatusUnauthorized {
 		ps.copyResponse(w, resp)
 		return
 	}
@@ -293,9 +293,9 @@ func (ps *proxyServer) proxyAuth(w http.ResponseWriter, r *http.Request, upstrea
 	}
 
 	scope := r.URL.Query().Get("scope")
-	if scope != "" && upstream == dockerHubUpstream && !strings.Contains(scope, "/") {
+	if scope != "" && upstream == dockerHubUpstream {
 		parts := strings.SplitN(scope, ":", 3)
-		if len(parts) == 3 {
+		if len(parts) == 3 && !strings.Contains(parts[1], "/") {
 			scope = parts[0] + ":library/" + parts[1] + ":" + parts[2]
 		}
 	}
@@ -348,13 +348,13 @@ func (ps *proxyServer) proxyForward(w http.ResponseWriter, r *http.Request, upst
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 401 {
+	if resp.StatusCode == http.StatusUnauthorized {
 		ps.unauthorizedResponse(w, r)
 		return
 	}
 
 	// Docker Hub 重定向处理
-	if upstream == dockerHubUpstream && resp.StatusCode == 307 {
+	if upstream == dockerHubUpstream && resp.StatusCode == http.StatusTemporaryRedirect {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			redirectReq, _ := http.NewRequestWithContext(r.Context(), "GET", loc, nil)
 			redirectResp, err := ps.clientFollow.Do(redirectReq)
@@ -385,7 +385,7 @@ func (ps *proxyServer) unauthorizedResponse(w http.ResponseWriter, r *http.Reque
 	}
 
 	w.Header().Set("Www-Authenticate", fmt.Sprintf(`Bearer realm="%s://%s/v2/auth",service="%s"`, scheme, host, serviceName))
-	ps.jsonResponse(w, 401, map[string]string{"error": "Unauthorized"})
+	ps.jsonResponse(w, http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
 }
 
 func (ps *proxyServer) copyResponse(w http.ResponseWriter, resp *http.Response) {
@@ -400,7 +400,7 @@ func (ps *proxyServer) copyResponse(w http.ResponseWriter, resp *http.Response) 
 
 func (ps *proxyServer) errorResponse(w http.ResponseWriter, err error) {
 	log.Printf("上游错误: %v", err)
-	ps.jsonResponse(w, 502, map[string]string{"error": err.Error()})
+	ps.jsonResponse(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 }
 
 func (ps *proxyServer) jsonResponse(w http.ResponseWriter, status int, data any) {
@@ -443,7 +443,7 @@ func extractImage(path string) string {
 func ensureLibrary(path string) string {
 	// /v2/{name}/{action}/{ref} -> /v2/library/{name}/{action}/{ref}
 	parts := strings.Split(path, "/")
-	if len(parts) == 5 && parts[1] == "v2" && parts[2] != "library" {
+	if len(parts) == 5 && parts[0] == "" && parts[1] == "v2" && parts[2] != "" && parts[2] != "library" {
 		return "/v2/library/" + parts[2] + "/" + parts[3] + "/" + parts[4]
 	}
 	return ""
